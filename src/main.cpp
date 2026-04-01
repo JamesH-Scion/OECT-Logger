@@ -12,8 +12,11 @@
 #include <AsyncTCP.h>
 #include <ESPmDNS.h> 
 #include <Preferences.h>
+#include <esp_sleep.h>
+#include <driver/gpio.h>
 
-#define _TASK_SLEEP_ON_IDLE_RUN //light sleep when not running tasks (Not working currently)
+// TaskScheduler's built-in ESP32 sleep callback is a stub in this library version,
+// so light sleep is managed explicitly in loop().
 
 //#define DEVICE_NAME "OECTLogger19" // change for each logger
 #define PIN PIN_NEOPIXEL
@@ -85,8 +88,10 @@ class SimpleEMA {
     bool initialized;
 };
 
-SimpleEMA emaFilter_1(0.4);
-SimpleEMA emaFilter_2(0.4);
+SimpleEMA emaFilter_1(0.1);
+SimpleEMA emaFilter_2(0.1);
+SimpleEMA emaFilter_vex1(0.1);
+SimpleEMA emaFilter_vex2(0.1);
 
 volatile float vex2 = -0.4;      // Variable formally gate voltage
 volatile float vex1 = -0.4;     // Variable formally source voltage
@@ -150,6 +155,8 @@ void activateWiFiAndWebServer();
 void deactivateWiFiAndWebServer();
 void IRAM_ATTR buttonISR();
 void deactivateWiFiAndWebServerCallback(); // Callback for the scheduler task
+long getNextTaskDueMs();
+void lightSleepUntilNextTask();
 
 // --- Task Scheduler Setup ---
 Task readADCTask(10000, TASK_FOREVER, &readADCCallback); 
@@ -163,6 +170,9 @@ Task blinkLEDTask(1000, TASK_FOREVER, &blinkStatusLEDCallback);
 Task checkButtonTask(1000, TASK_FOREVER, &checkButtonTaskCallback);
 
 Scheduler runner;
+
+const long LIGHT_SLEEP_GUARD_MS = 5;
+const long LIGHT_SLEEP_MIN_MS = 20;
 
 void setup() {
   Serial.begin(115200);
@@ -486,6 +496,56 @@ server.on("/rtctime", HTTP_GET, [](AsyncWebServerRequest *request){
 
 void loop() {
   runner.execute();
+  lightSleepUntilNextTask();
+}
+
+long getNextTaskDueMs() {
+  long nextDueMs = -1;
+
+  const long taskDueTimes[] = {
+    runner.timeUntilNextIteration(readADCTask),
+    runner.timeUntilNextIteration(sendSensorDataTask),
+    runner.timeUntilNextIteration(readUserInputTask),
+    runner.timeUntilNextIteration(readBatteryTask),
+    runner.timeUntilNextIteration(blinkLEDTask),
+    runner.timeUntilNextIteration(checkButtonTask),
+    runner.timeUntilNextIteration(wifiTimerTask)
+  };
+
+  for (long due : taskDueTimes) {
+    if (due < 0) {
+      continue;
+    }
+    if (nextDueMs < 0 || due < nextDueMs) {
+      nextDueMs = due;
+    }
+  }
+
+  return nextDueMs;
+}
+
+void lightSleepUntilNextTask() {
+  // Keep AP/server responsive while Wi-Fi mode is active.
+  if (wifiActive) {
+    return;
+  }
+
+  long nextDueMs = getNextTaskDueMs();
+  if (nextDueMs < 0) {
+    return;
+  }
+
+  long sleepMs = nextDueMs - LIGHT_SLEEP_GUARD_MS;
+  if (sleepMs < LIGHT_SLEEP_MIN_MS) {
+    return;
+  }
+
+  // Optional button wake for light sleep (if supported by this target core).
+  gpio_wakeup_enable((gpio_num_t)BUTTON_PIN, GPIO_INTR_LOW_LEVEL);
+  esp_sleep_enable_gpio_wakeup();
+
+  esp_sleep_enable_timer_wakeup((uint64_t)sleepMs * 1000ULL);
+  esp_light_sleep_start();
 }
 
 // --- New Functions for WiFi and Web Server Control ---
@@ -538,41 +598,65 @@ void IRAM_ATTR buttonISR() {
 }
 
 // This function performs the ADC conversion and returns the raw ADC value.
-long getADCReading() {
-  ads.start(); 
-  unsigned long start_time = millis(); 
-  boolean drdy = false; 
+// numSamples > 1 oversamples and averages for improved noise rejection.
+long getADCReading(int numSamples = 1) {
+  int64_t sum = 0;
+  for (int i = 0; i < numSamples; i++) {
+    ads.start();
+    unsigned long start_time = millis();
+    boolean drdy = false;
 
-  while((drdy == false) && (millis() < (start_time + ADS122C04_CONVERSION_TIMEOUT))) {
-    delay(5); 
-    drdy = ads.checkDataReady(); 
-  }
+    while ((drdy == false) && (millis() < (start_time + ADS122C04_CONVERSION_TIMEOUT))) {
+      delay(5);
+      drdy = ads.checkDataReady();
+    }
 
-  if (drdy == false) {
-    Serial.println(F("checkDataReady timed out"));
-    return 0; // Return 0 or an error value on timeout
+    if (drdy == false) {
+      Serial.println(F("checkDataReady timed out"));
+      return 0;
+    }
+    sum += (int32_t)ads.readADC();
   }
-  return ads.readADC();
+  return (long)(sum / numSamples);
 }
 
 // This is the main callback function that takes two measurements,
 // converts them to voltage and current, and stores them in global variables.
+// All four channels (current + excitation voltage) are measured together so
+// every logged row contains perfectly time-aligned data.
 void readADCCallback() {
-  // First Measurement (AIN0)
+  int32_t raw_vex1, raw_vex2;
+
+  // First Measurement (AIN0) — TIA output Ch1
   ads.setInputMultiplexer(ADS122C04_MUX_AIN0_AVSS);
-  delay(10); // Small delay to allow MUX to settle
-  raw_ADC_data_1 = getADCReading();
+  delay(50); // Increased MUX settle time
+  getADCReading(); // dummy conversion — discarded to flush MUX transient
+  raw_ADC_data_1 = getADCReading(8); // 8-sample average
   filtered_ADC_data_1 = emaFilter_1.filter(raw_ADC_data_1);
   voltage_1 = (filtered_ADC_data_1 / ADC_MAX_VALUE) * V_REF - V_OFFSET;
   current_1 = ((-(voltage_1))/1000) * 1000; // in mA for 1k resistor
 
-  // Second Measurement (AIN1)
+  // Second Measurement (AIN1) — TIA output Ch2
   ads.setInputMultiplexer(ADS122C04_MUX_AIN1_AVSS);
-  delay(10); // Small delay to allow MUX to settle
-  raw_ADC_data_2 = getADCReading();
+  delay(50);
+  getADCReading(); // dummy conversion — discarded
+  raw_ADC_data_2 = getADCReading(8);
   filtered_ADC_data_2 = emaFilter_2.filter(raw_ADC_data_2);
   voltage_2 = (filtered_ADC_data_2 / ADC_MAX_VALUE) * V_REF - V_OFFSET;
   current_2 = ((-(voltage_2))/1000) * 1000; // in mA for 1k resistor
+
+  // Excitation voltage measurements (AIN3 = vex1, AIN2 = vex2) — synchronized
+  ads.setInputMultiplexer(ADS122C04_MUX_AIN3_AVSS);
+  delay(50);
+  getADCReading(); // dummy conversion — discarded
+  raw_vex1 = getADCReading(8);
+  vex1_s = emaFilter_vex1.filter(((float)raw_vex1 / ADC_MAX_VALUE) * V_REF - 2.5);
+
+  ads.setInputMultiplexer(ADS122C04_MUX_AIN2_AVSS);
+  delay(50);
+  getADCReading(); // dummy conversion — discarded
+  raw_vex2 = getADCReading(8);
+  vex2_s = emaFilter_vex2.filter(((float)raw_vex2 / ADC_MAX_VALUE) * V_REF - 2.5);
 }
 
 void readBatteryCallback(){
@@ -591,24 +675,14 @@ void readBatteryCallback(){
 
 void sendSensorDataCallback(){
 
-  int raw_vex1, raw_vex2;
-  
   char sample_str[400];
 
   temp = bme.readTemperature();
   rh = bme.readHumidity();
   press = (bme.readPressure() / 100);
 
-  ads.setInputMultiplexer(ADS122C04_MUX_AIN3_AVSS);
-  delay(10); // Small delay to allow MUX to settle
-   
-  raw_vex1 = getADCReading();
-  vex1_s = ((float)raw_vex1 / ADC_MAX_VALUE) * V_REF - 2.5; 
-
-  ads.setInputMultiplexer(ADS122C04_MUX_AIN2_AVSS);
-  delay(10); // Small delay to allow MUX to settle
-  raw_vex2 = getADCReading();
-  vex2_s = ((float)raw_vex2 / ADC_MAX_VALUE) * V_REF - 2.5; 
+  // vex1_s and vex2_s are already measured and EMA-filtered in readADCCallback()
+  // for time-aligned data with the current measurements.
 
   DateTime now = rtc.now();
 

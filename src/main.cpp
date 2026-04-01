@@ -133,7 +133,7 @@ void onValuesUpdated();
 float mapRange(float value, float inMin, float inMax, float outMin, float outMax);
 bool setupADC();
 bool setupBME();
-void setOutputVoltage(Adafruit_MCP4725 &dac, float targetVoltage);
+float setOutputVoltage(Adafruit_MCP4725 &dac, int adcFbCh, float targetVoltage);
 void readADCCallback();
 void sendSensorDataCallback();
 void readTempRHCallBack();
@@ -848,6 +848,7 @@ float setOutputVoltage(Adafruit_MCP4725 &dac, int adcFbCh, float targetVoltage) 
   }
 
   Serial.println("Max attempts reached without hitting target.");
+  return targetVoltage;
 }
 
 
@@ -887,13 +888,14 @@ void serveFile(AsyncWebServerRequest *request, const char* path) {
     return;
   }
 
-  AsyncWebServerResponse *response = request->beginResponse(
-    "text/csv", file.fileSize(),
-    [file](uint8_t *buffer, size_t maxLen, size_t index) mutable -> size_t {
-      file.seek(index);
-      return file.read(buffer, maxLen);
-    }
-  );
+  String csvData;
+  csvData.reserve((size_t)file.fileSize());
+  while (file.available()) {
+    csvData += (char)file.read();
+  }
+  file.close();
+
+  AsyncWebServerResponse *response = request->beginResponse(200, "text/csv", csvData);
   response->addHeader("Content-Disposition", String("attachment; filename=") + String(path).substring(1));
   request->send(response);
 }
